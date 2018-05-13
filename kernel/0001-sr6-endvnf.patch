@@ -1,0 +1,77 @@
+diff --git a/include/uapi/linux/seg6_local.h b/include/uapi/linux/seg6_local.h
+index ef2d8c3..89c6916 100644
+--- a/include/uapi/linux/seg6_local.h
++++ b/include/uapi/linux/seg6_local.h
+@@ -59,6 +59,8 @@ enum {
+ 	SEG6_LOCAL_ACTION_END_AS	= 13,
+ 	/* forward to SR-unaware VNF with masquerading */
+ 	SEG6_LOCAL_ACTION_END_AM	= 14,
++	/* forward to hybrid SR-aware VNF */
++	SEG6_LOCAL_ACTION_END_VNF	= 15,
+ 
+ 	__SEG6_LOCAL_ACTION_MAX,
+ };
+diff --git a/net/ipv6/seg6_local.c b/net/ipv6/seg6_local.c
+index 825b8e0..6ca8599 100644
+--- a/net/ipv6/seg6_local.c
++++ b/net/ipv6/seg6_local.c
+@@ -447,6 +447,45 @@ static int input_action_end_b6_encap(struct sk_buff *skb,
+ 	return err;
+ }
+ 
++static int input_action_end_vnf(struct sk_buff *skb,
++				struct seg6_local_lwt *slwt)
++{
++	struct net *net = dev_net(skb->dev);
++	struct ipv6_sr_hdr *srh;
++	struct net_device *odev;
++	struct ethhdr *eth;
++	int err = -EINVAL;
++
++	srh = get_and_validate_srh(skb);
++	if (!srh)
++		goto drop;
++
++	odev = dev_get_by_index_rcu(net, slwt->oif);
++	if (!odev)
++		goto drop;
++
++	if (skb->ip_summed == CHECKSUM_COMPLETE)
++		skb->ip_summed = CHECKSUM_NONE;
++
++	srh->segments_left = 0;
++	ipv6_hdr(skb)->daddr = srh->segments[0];
++
++	skb_reset_network_header(skb);
++	skb_reset_transport_header(skb);
++
++	eth = (struct ethhdr *)skb_mac_header(skb);
++	memcpy(eth->h_dest, odev->dev_addr, ETH_ALEN);
++
++	__skb_tunnel_rx(skb, odev, net);
++	netif_rx(skb);
++
++	return 0;
++
++drop:
++	kfree_skb(skb);
++	return err;
++}
++
+ static struct seg6_action_desc seg6_action_table[] = {
+ 	{
+ 		.action		= SEG6_LOCAL_ACTION_END,
+@@ -493,7 +532,12 @@ static struct seg6_action_desc seg6_action_table[] = {
+ 		.attrs		= (1 << SEG6_LOCAL_SRH),
+ 		.input		= input_action_end_b6_encap,
+ 		.static_headroom	= sizeof(struct ipv6hdr),
+-	}
++	},
++	{
++		.action		= SEG6_LOCAL_ACTION_END_VNF,
++		.attrs		= (1 << SEG6_LOCAL_OIF),
++		.input		= input_action_end_vnf,
++	},
+ };
+ 
+ static struct seg6_action_desc *__get_action_desc(int action)

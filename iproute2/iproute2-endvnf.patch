@@ -1,0 +1,25 @@
+diff --git a/include/uapi/linux/seg6_local.h b/include/uapi/linux/seg6_local.h
+index 76b90d60..f7225d7d 100644
+--- a/include/uapi/linux/seg6_local.h
++++ b/include/uapi/linux/seg6_local.h
+@@ -59,6 +59,8 @@ enum {
+ 	SEG6_LOCAL_ACTION_END_AS	= 13,
+ 	/* forward to SR-unaware VNF with masquerading */
+ 	SEG6_LOCAL_ACTION_END_AM	= 14,
++	/* forward to hybrid SR-aware VNF */
++	SEG6_LOCAL_ACTION_END_VNF	= 15,
+ 
+ 	__SEG6_LOCAL_ACTION_MAX,
+ };
+diff --git a/ip/iproute_lwtunnel.c b/ip/iproute_lwtunnel.c
+index 1c8adbe7..82881b60 100644
+--- a/ip/iproute_lwtunnel.c
++++ b/ip/iproute_lwtunnel.c
+@@ -167,6 +167,7 @@ static const char *seg6_action_names[SEG6_LOCAL_ACTION_MAX + 1] = {
+ 	[SEG6_LOCAL_ACTION_END_S]		= "End.S",
+ 	[SEG6_LOCAL_ACTION_END_AS]		= "End.AS",
+ 	[SEG6_LOCAL_ACTION_END_AM]		= "End.AM",
++	[SEG6_LOCAL_ACTION_END_VNF]		= "End.VNF",
+ };
+ 
+ static const char *format_action_type(int action)

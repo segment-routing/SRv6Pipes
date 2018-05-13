@@ -1,0 +1,27 @@
+diff --git a/include/uapi/linux/seg6.h b/include/uapi/linux/seg6.h
+index 268119a..3ad13c5 100644
+--- a/include/uapi/linux/seg6.h
++++ b/include/uapi/linux/seg6.h
+@@ -55,7 +55,8 @@ struct sr6_tlv {
+ 
+ struct sr6_tlv_retpath {
+ 	struct sr6_tlv	tlvhdr;
+-	__u8 		reserved[6];
++	__u8 		reserved[5];
++	__u8		segments_left;
+ 	struct in6_addr segments[0];
+ };
+ 
+diff --git a/net/ipv6/seg6.c b/net/ipv6/seg6.c
+index 04398c1..7330fb2 100644
+--- a/net/ipv6/seg6.c
++++ b/net/ipv6/seg6.c
+@@ -121,7 +121,7 @@ static int seg6_retpath_to_srh(struct sr6_tlv_retpath *rt_tlv,
+ 	isrh->nexthdr = 0;
+ 	isrh->hdrlen = nsegs << 1;
+ 	isrh->type = IPV6_SRCRT_TYPE_4;
+-	isrh->segments_left = nsegs - 1;
++	isrh->segments_left = rt_tlv->segments_left;
+ 	isrh->first_segment = nsegs - 1;
+ 	isrh->flags = 0;
+ 	isrh->tag = 0;

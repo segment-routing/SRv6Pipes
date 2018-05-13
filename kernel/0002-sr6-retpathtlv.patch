@@ -1,0 +1,193 @@
+diff --git a/include/net/seg6.h b/include/net/seg6.h
+index 099bad5..f2a6346 100644
+--- a/include/net/seg6.h
++++ b/include/net/seg6.h
+@@ -63,5 +63,8 @@ extern bool seg6_validate_srh(struct ipv6_sr_hdr *srh, int len);
+ extern int seg6_do_srh_encap(struct sk_buff *skb, struct ipv6_sr_hdr *osrh,
+ 			     int proto);
+ extern int seg6_do_srh_inline(struct sk_buff *skb, struct ipv6_sr_hdr *osrh);
++extern struct ipv6_txoptions *seg6_process_retpath(struct sk_buff *skb,
++						   struct sock *sk,
++						   unsigned int srcrt_offset);
+ 
+ #endif
+diff --git a/include/uapi/linux/seg6.h b/include/uapi/linux/seg6.h
+index 286e8d6..268119a 100644
+--- a/include/uapi/linux/seg6.h
++++ b/include/uapi/linux/seg6.h
+@@ -43,6 +43,7 @@ struct ipv6_sr_hdr {
+ #define SR6_TLV_OPAQUE		3
+ #define SR6_TLV_PADDING		4
+ #define SR6_TLV_HMAC		5
++#define SR6_TLV_RETPATH		6
+ 
+ #define sr_has_hmac(srh) ((srh)->flags & SR6_FLAG1_HMAC)
+ 
+@@ -52,4 +53,10 @@ struct sr6_tlv {
+ 	__u8 data[0];
+ };
+ 
++struct sr6_tlv_retpath {
++	struct sr6_tlv	tlvhdr;
++	__u8 		reserved[6];
++	struct in6_addr segments[0];
++};
++
+ #endif
+diff --git a/net/ipv6/seg6.c b/net/ipv6/seg6.c
+index 7f5621d..04398c1 100644
+--- a/net/ipv6/seg6.c
++++ b/net/ipv6/seg6.c
+@@ -69,6 +69,106 @@ bool seg6_validate_srh(struct ipv6_sr_hdr *srh, int len)
+ 	return true;
+ }
+ 
++static struct sr6_tlv *seg6_find_tlv(struct ipv6_sr_hdr *srh, int tlvid)
++{
++	unsigned int tlv_offset;
++	int trailing, len;
++
++	tlv_offset = sizeof(*srh) + ((srh->first_segment + 1) << 4);
++	len = (srh->hdrlen + 1) << 3;
++
++	trailing = len - tlv_offset;
++	if (trailing < 0)
++		return NULL;
++
++	while (trailing) {
++		unsigned int tlv_len;
++		struct sr6_tlv *tlv;
++
++		if (trailing < sizeof(*tlv))
++			return false;
++
++		tlv = (struct sr6_tlv *)((unsigned char *)srh + tlv_offset);
++		tlv_len = sizeof(*tlv) + tlv->len;
++
++		trailing -= tlv_len;
++		if (trailing < 0)
++			return NULL;
++
++		if (tlv->type == tlvid)
++			return tlv;
++
++		tlv_offset += tlv_len;
++	}
++
++	return NULL;
++}
++
++static int seg6_retpath_to_srh(struct sr6_tlv_retpath *rt_tlv,
++			       struct ipv6_sr_hdr *isrh)
++{
++	int nsegs, seglen;
++
++	/* subtract reserved bytes */
++	seglen = rt_tlv->tlvhdr.len - 6;
++
++	/* actual TLV length must be a multiple of 16 bytes */
++	if ((seglen & 0xf) != 0)
++		return -EINVAL;
++
++	nsegs = seglen >> 4;
++
++	isrh->nexthdr = 0;
++	isrh->hdrlen = nsegs << 1;
++	isrh->type = IPV6_SRCRT_TYPE_4;
++	isrh->segments_left = nsegs - 1;
++	isrh->first_segment = nsegs - 1;
++	isrh->flags = 0;
++	isrh->tag = 0;
++
++	memcpy(isrh->segments, rt_tlv->segments,
++	       nsegs * sizeof(struct in6_addr));
++
++	return 0;
++}
++
++/* skb has gone through ipv6_srh_rcv() with SL==0 */
++struct ipv6_txoptions *seg6_process_retpath(struct sk_buff *skb,
++					    struct sock *sk,
++					    unsigned int srcrt_offset)
++{
++	struct sr6_tlv_retpath *rt_tlv;
++	struct ipv6_sr_hdr *srh, *rsrh;
++	struct ipv6_txoptions *opt;
++	unsigned int len;
++
++	srh = (struct ipv6_sr_hdr *)(skb_network_header(skb) +
++				     srcrt_offset);
++
++	rt_tlv = (struct sr6_tlv_retpath *)seg6_find_tlv(srh, SR6_TLV_RETPATH);
++	if (!rt_tlv)
++		return NULL;
++
++	len = sizeof(*opt) + sizeof(*srh) + rt_tlv->tlvhdr.len - 6;
++
++	opt = sock_kmalloc(sk, len, GFP_ATOMIC);
++	if (!opt)
++		return NULL;
++
++	memset(opt, 0, len);
++	rsrh = (struct ipv6_sr_hdr *)(opt + 1);
++
++	if (seg6_retpath_to_srh(rt_tlv, rsrh) < 0) {
++		sock_kfree_s(sk, opt, len);
++		return NULL;
++	}
++
++	opt->srcrt = (struct ipv6_rt_hdr *)rsrh;
++	opt->opt_nflen = ipv6_optlen(opt->srcrt);
++
++	return opt;
++}
++
+ static struct genl_family seg6_genl_family;
+ 
+ static const struct nla_policy seg6_genl_policy[SEG6_ATTR_MAX + 1] = {
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index 883df0a..955f01e 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -62,6 +62,7 @@
+ #include <net/inet_common.h>
+ #include <net/secure_seq.h>
+ #include <net/busy_poll.h>
++#include <net/seg6.h>
+ 
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+@@ -1048,6 +1049,7 @@ static struct sock *tcp_v6_syn_recv_sock(const struct sock *sk, struct sk_buff *
+ 	struct ipv6_txoptions *opt;
+ 	struct tcp6_sock *newtcp6sk;
+ 	struct inet_sock *newinet;
++	unsigned int srcrt_offset;
+ 	struct tcp_sock *newtp;
+ 	struct sock *newsk;
+ #ifdef CONFIG_TCP_MD5SIG
+@@ -1181,6 +1183,25 @@ static struct sock *tcp_v6_syn_recv_sock(const struct sock *sk, struct sk_buff *
+ 		opt = ipv6_dup_options(newsk, opt);
+ 		RCU_INIT_POINTER(newnp->opt, opt);
+ 	}
++
++	/* If no socket options were defined on the listening socket and
++	 * there is an inbound SRH present, use the RETPATH TLV as outbound
++	 * SRH, if such TLV is present.
++	 *
++	 * IPv6 CB was overriden by TCP cb, so we cannot use IP6CB(skb)
++	 * to access srcrt offset. Moreover, we cannot use tcp_v6_restore_cb()
++	 * because we'll need to fill it again and we don't have TCP header
++	 * pointer. Thus, we directly access IPv6 CB copy within TCP cb to
++	 * fetch the srcrt offset.
++	 */
++	srcrt_offset = ((struct inet6_skb_parm *)
++			(&TCP_SKB_CB(skb)->header.h6))->srcrt;
++	if (!opt && srcrt_offset) {
++		opt = seg6_process_retpath(skb, newsk, srcrt_offset);
++		if (opt)
++			RCU_INIT_POINTER(newnp->opt, opt);
++	}
++
+ 	inet_csk(newsk)->icsk_ext_hdr_len = 0;
+ 	if (opt)
+ 		inet_csk(newsk)->icsk_ext_hdr_len = opt->opt_nflen +
